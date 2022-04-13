@@ -1,6 +1,5 @@
 # ryu-manager shortest_forward.py --observe-links
 from ryu.base import app_manager
-from ryu.base.app_manager import lookup_service_brick
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, HANDSHAKE_DISPATCHER
 from ryu.controller.handler import set_ev_cls
@@ -72,56 +71,8 @@ class ShortestForward(app_manager.RyuApp):
             self.handle_ipv4(msg, ipv4_pkt.src, ipv4_pkt.dst, pkt_type)
 
     def handle_arp(self, msg, in_port, dst,src, pkt,pkt_type):
-        #just handle loop here
-        #just like your code in exp1 mission2
-        
-        dp = msg.datapath
-        dpid = dp.id
-        ofp = dp.ofproto
-        parser = dp.ofproto_parser
-        self.mac_to_port.setdefault(dpid, {})
-        
-        header_list = dict((p.protocol_name, p)
-                           for p in pkt.protocols if type(p) != str)
-        
-        if dst == ETHERNET_MULTICAST and ARP in header_list:
-            arp_dst_ip = header_list[ARP].dst_ip
-            if (dp.id, src, arp_dst_ip) in self.sw:
-                if self.sw[(dp.id, src, arp_dst_ip)] != in_port:
-                    # drop the packet
-                    out = parser.OFPPacketOut(
-                        datapath=dp,
-                        buffer_id=ofp.OFP_NO_BUFFER,
-                        in_port=in_port,
-                        actions=[],
-                        data=None)
-                    dp.send_msg(out)
-                    return
-                else:
-                    pass
-            else:
-                self.sw[(dp.id, src, arp_dst_ip)] = in_port
-
-        self.mac_to_port[dpid][src] = in_port
-
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
-        else:
-            out_port = ofp.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(out_port)]
-
-        if out_port != ofp.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            self.add_flow(dp, 1, match, actions)
-
-        out = parser.OFPPacketOut(
-            datapath=dp,
-            buffer_id=ofp.OFP_NO_BUFFER,
-            in_port=in_port,
-            actions=actions,
-            data=msg.data)
-        dp.send_msg(out)
+    #just handle loop here
+    #just like your code in exp1 mission2
 
     def handle_ipv4(self, msg, src_ip, dst_ip, pkt_type):
         parser = msg.datapath.ofproto_parser
