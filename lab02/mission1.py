@@ -1,8 +1,8 @@
 # ryu-manager shortest_forward.py --observe-links
-from ryu.base.app_manager import lookup_service_brick
+from pkg_resources import get_default_cache
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, HANDSHAKE_DISPATCHER
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
@@ -32,7 +32,6 @@ class ShortestForward(app_manager.RyuApp):
         self.sw = {}
         self.path = None
         self.switches = None
-        self.lldp_delay = {}
 
     def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0):
         dp = datapath
@@ -57,20 +56,6 @@ class ShortestForward(app_manager.RyuApp):
         dpid = dp.id
         in_port = msg.match['in_port']
         self.mac_to_port.setdefault(dpid, {})
-
-        try:
-            src_dpid, src_port_no = switches.LLDPPacket.lldp_parse(msg.data)
-
-            if self.switches is None:
-                self.switches = lookup_service_brick('switches')
-
-            for port in self.switches.ports.keys():
-                if src_dpid == port.dpid and src_port_no == port.port_no:
-                    self.lldp_delay[(src_dpid, dpid)
-                               ] = self.switches.ports[port].delay
-        except:
-            pass
-        print(self.lldp_delay)
 
         pkt = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
