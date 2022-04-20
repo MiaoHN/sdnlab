@@ -45,6 +45,28 @@ class ShortestForward(app_manager.RyuApp):
             hard_timeout=hard_timeout,
             match=match, instructions=inst)
         dp.send_msg(mod)
+    
+    def delete_flow(self, datapath, match):
+        dp = datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        cookie = cookie_mask = 0
+        table_id = 0
+        priority = 100
+        idle_timeout = 10
+        hard_timeout = 60
+        buffer_id = ofp.OFP_NO_BUFFER
+        
+        actions = []
+        inst = []
+        
+        mod = parser.OFPFlowMod(
+            dp, cookie, cookie_mask, table_id,
+            ofp.OFPFC_DELETE,idle_timeout,
+            hard_timeout, priority, buffer_id,
+            ofp.OFPP_ANY, ofp.OFPG_ANY, ofp.OFPFF_SEND_FLOW_REM,
+            match, inst)
+        dp.sned_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):

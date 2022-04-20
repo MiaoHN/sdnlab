@@ -1,3 +1,4 @@
+from asyncore import read
 from ryu.base import app_manager
 from ryu.base.app_manager import lookup_service_brick
 from ryu.ofproto import ofproto_v1_3
@@ -72,7 +73,7 @@ class NetworkAwareness(app_manager.RyuApp):
 
         if ev.state == DEAD_DISPATCHER:
             del self.switch_info[dpid]
-    
+
     def _get_echo(self):
         while True:
             self.send_echo_request()
@@ -81,10 +82,28 @@ class NetworkAwareness(app_manager.RyuApp):
     def send_echo_request(self):
         for datapath in self.switch_info.values():
             parser = datapath.ofproto_parser
-            echo_req = parser.OFPEchoRequest(datapath, data=bytes("%.12f" % time.time(), encoding='utf-8'))
+            echo_req = parser.OFPEchoRequest(datapath, data=bytes(
+                "%.12f" % time.time(), encoding='utf-8'))
 
             datapath.send_msg(echo_req)
             hub.sleep(0.5)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+
+        if msg.reason in [ofproto.OFPPR_ADD, ofproto.OFPPR_MODIFY]:
+            datapath.port[msg.desc.port_no] = msg.desc
+        elif msg.reason == ofproto.OFPPR_DELETE:
+            datapath.ports.pop(msg.desc.port_no, None)
+        else:
+            return
+
+        self.send_event_to_observers(
+            ofp_event.EventOFPPortStateChante(
+                datapath, msg.reason, msg.desc.port_no), datapath.state)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -98,11 +117,12 @@ class NetworkAwareness(app_manager.RyuApp):
 
             for port in self.switches.ports.keys():
                 if src_dpid == port.dpid and src_port_no == port.port_no:
-                    self.lldp_delay[(src_dpid, dpid)] = self.switches.ports[port].delay
+                    self.lldp_delay[(src_dpid, dpid)
+                                    ] = self.switches.ports[port].delay
                     self.rtt[(src_dpid, dpid)] = self.get_delay(src_dpid, dpid)
         except:
             return
-        
+
     def get_delay(self, src, dst):
         try:
             lldp12 = self.lldp_delay[(src, dst)]
@@ -117,11 +137,12 @@ class NetworkAwareness(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPEchoReply, [MAIN_DISPATCHER, CONFIG_DISPATCHER, HANDSHAKE_DISPATCHER])
     def echo_reply_handler(self, ev):
         try:
-            self.echo_delay[ev.msg.datapath.id] = time.time() - eval(ev.msg.data)
+            self.echo_delay[ev.msg.datapath.id] = time.time() - \
+                eval(ev.msg.data)
         except Exception as error:
             print(error)
             return
-    
+
     def _get_topology(self):
         _hosts, _switches, _links = None, None, None
         while True:
