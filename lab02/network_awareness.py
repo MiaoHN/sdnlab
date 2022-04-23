@@ -32,6 +32,10 @@ class NetworkAwareness(app_manager.RyuApp):
         self.port_info = {}  # dpid: (ports linked hosts)
         self.topo_map = nx.Graph()
         self.topo_thread = hub.spawn(self._get_topology)
+        self.echo_thread = hub.spawn(self._send_echo)
+        self.lldp_delay = {}
+        self.echo_delay = {}
+        self.rtt = {}
 
         self.weight = 'hop'
 
@@ -67,6 +71,34 @@ class NetworkAwareness(app_manager.RyuApp):
 
         if ev.state == DEAD_DISPATCHER:
             del self.switch_info[dpid]
+
+    @set_ev_cls(ofp_event.EventOFPEchoReply, MAIN_DISPATCHER)
+    def echo_reply_handler(self, ev):
+        try:
+            latency = time.time() - eval(ev.msg.data)
+            self.echo_delay[ev.msg.datapath.id] = latency
+        except:
+            return
+
+    def calc_delay(self, src, dst):
+        try:
+            lldp12 = self.lldp_delay[(src, dst)]
+            lldp21 = self.lldp_delay[(dst, src)]
+            echo1 = self.echo_delay[src]
+            echo2 = self.echo_delay[dst]
+            delay = (lldp12 + lldp21 - echo1 - echo2) / 2
+            return max(delay, 0)
+        except:
+            return float('inf')
+
+    def _send_echo(self):
+        while True:
+            for datapath in self.switch_info.values():
+                parser = datapath.ofproto_parser
+                echo_req = parser.OFPEchoRequest(datapath, data=bytes(
+                    "%.12f" % time.time(), encoding='utf-8'))
+                datapath.send_msg(echo_req)
+            hub.sleep(SEND_ECHO_REQUEST_INTERVAL)
 
     def _get_topology(self):
         _hosts, _switches, _links = None, None, None
@@ -110,10 +142,10 @@ class NetworkAwareness(app_manager.RyuApp):
                 self.link_info[(link.dst.dpid, link.src.dpid)
                                ] = link.dst.port_no
                 self.topo_map.add_edge(
-                    link.src.dpid, link.dst.dpid, hop=1, is_host=False)
+                    link.src.dpid, link.dst.dpid, hop=self.rtt[(link.src.dpid, link.dst.dpid)], is_host=False)
 
-            if self.weight == 'hop':
-                self.show_topo_map()
+            # if self.weight == 'hop':
+            #     self.show_topo_map()
             hub.sleep(GET_TOPOLOGY_INTERVAL)
 
     def shortest_path(self, src, dst, weight='hop'):
