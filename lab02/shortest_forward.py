@@ -8,6 +8,7 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from ryu.lib.packet import packet
+from ryu.topology.api import get_switch
 from ryu.lib.packet import ethernet, arp, ipv4, lldp
 from ryu.controller import ofp_event
 from ryu.topology.switches import LLDPPacket
@@ -47,6 +48,40 @@ class ShortestForward(app_manager.RyuApp):
             hard_timeout=hard_timeout,
             match=match, instructions=inst)
         dp.send_msg(mod)
+
+    def del_flow(self, datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        if bool(self.mac_to_port):
+            for dst in self.mac_to_port[datapath.id].keys():
+                match = parser.OFPMatch(eth_dst=dst)
+                mod = parser.OFPFlowMod(
+                    datapath, command=ofproto.OFPFC_DELETE,
+                    out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
+                    priority=1, match=match
+                )
+                datapath.send_msg(mod)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        datapath.ports.pop(msg.desc.port_no, None)
+
+        switches = get_switch(self)
+        for switch in switches:
+            self.del_flow(switch.dp)
+        self.mac_to_port = {}
+        self.sw = {}
+        self.network_awareness.link_info.clear()
+        self.network_awareness.port_link.clear()
+        self.network_awareness.port_info.clear()
+        self.network_awareness.topo_map.clear()
+
+        self.send_event_to_observers(
+            ofp_event.EventOFPPortStateChange(
+                datapath, msg.reason, msg.desc.port_no), datapath.state
+        )
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -88,8 +123,6 @@ class ShortestForward(app_manager.RyuApp):
                 if src_dpid == port.dpid and src_port_no == port.port_no:
                     self.network_awareness.lldp_delay[(src_dpid, dpid)
                                                       ] = self.switches.ports[port].delay
-                    self.network_awareness.rtt[(
-                        src_dpid, dpid)] = self.network_awareness.calc_delay(src_dpid, dpid)
         except:
             return
 
@@ -163,10 +196,6 @@ class ShortestForward(app_manager.RyuApp):
             port_path.append((in_port, dpid_path[i], out_port))
         self.show_path(src_ip, dst_ip, port_path)
         # calc path delay
-        print('--------------- lldp')
-        print(self.network_awareness.lldp_delay)
-        print('--------------- echo')
-        print(self.network_awareness.echo_delay)
 
         # send flow mod
         for node in port_path:

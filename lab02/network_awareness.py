@@ -1,3 +1,4 @@
+from cupshelpers import getDevices
 from ryu.base import app_manager
 from ryu.base.app_manager import lookup_service_brick
 from ryu.ofproto import ofproto_v1_3
@@ -33,6 +34,7 @@ class NetworkAwareness(app_manager.RyuApp):
         self.topo_map = nx.Graph()
         self.topo_thread = hub.spawn(self._get_topology)
         self.echo_thread = hub.spawn(self._send_echo)
+        self.update_thread = hub.spawn(self.update_delay)
         self.lldp_delay = {}
         self.echo_delay = {}
         self.rtt = {}
@@ -142,10 +144,8 @@ class NetworkAwareness(app_manager.RyuApp):
                 self.link_info[(link.dst.dpid, link.src.dpid)
                                ] = link.dst.port_no
                 self.topo_map.add_edge(
-                    link.src.dpid, link.dst.dpid, hop=self.rtt[(link.src.dpid, link.dst.dpid)], is_host=False)
+                    link.src.dpid, link.dst.dpid, hop=1, is_host=False)
 
-            # if self.weight == 'hop':
-            #     self.show_topo_map()
             hub.sleep(GET_TOPOLOGY_INTERVAL)
 
     def shortest_path(self, src, dst, weight='hop'):
@@ -156,9 +156,10 @@ class NetworkAwareness(app_manager.RyuApp):
         except:
             self.logger.info('host not find/no path')
 
-    def show_topo_map(self):
-        self.logger.info('topo map:')
-        self.logger.info('{:^10s}  ->  {:^10s}'.format('node', 'node'))
-        for src, dst in self.topo_map.edges:
-            self.logger.info('{:^10s}      {:^10s}'.format(str(src), str(dst)))
-        self.logger.info('\n')
+    def update_delay(self):
+        while True:
+            for edge in self.topo_map.edges:
+                weight = self.calc_delay(edge[0], edge[1])
+                self.topo_map[edge[0]][edge[1]][self.weight] = weight
+
+            hub.sleep(GET_DELAY_INTERVAL)
