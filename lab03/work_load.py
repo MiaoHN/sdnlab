@@ -39,8 +39,12 @@ class Workload(app_manager.RyuApp):
         self.mac_to_port = {}
         self.sw = {}  # use it to avoid arp loop
         self.weight = 'hop'
-        # you need to store workload of every port here
-        self.workload = {}  # dpid: {port_no : work_load}
+
+        # dpid: {port_no : work_load}
+        self.workload = {}  
+
+        # dpid: {port_no: (tx_bytes, rx_bytes, duration_sec, duration_nsec)}
+        self.workload_status = {} 
 
     def _count_workload(self):
         while True:
@@ -92,16 +96,33 @@ class Workload(app_manager.RyuApp):
         body = ev.msg.body
         dpid = ev.msg.datapath.id
         self.workload.setdefault(dpid, {})
+        self.workload_status.setdefault(dpid, {})
         # you need to code here to finish mission1
         # of course, you can define new function as you wish
-        # for stat in sorted(body, key=attrgetter('port_no')):
-        #    port_no = stat.port_no
-        #    if port_no != ofproto_v1_3.OFPP_LOCAL:
-        #        key = (dpid, port_no)
-        #        value = (stat.tx_bytes, stat.rx_bytes,
-        #                 stat.duration_sec, stat.duration_nsec)
-        #        print(key,end=':')
-        #        print(value)
+        for stat in sorted(body, key=attrgetter('port_no')):
+            port_no = stat.port_no
+            if port_no != ofproto_v1_3.OFPP_LOCAL:
+                value = (stat.tx_bytes, stat.rx_bytes,
+                         stat.duration_sec, stat.duration_nsec)
+                if dpid in self.workload_status:
+                    # if dpid has record then calculate
+                    if port_no in self.workload_status[dpid]:
+                        last_bits = (self.workload_status[dpid][port_no][0] + self.workload_status[dpid][port_no][1]) * 8
+                        curr_bits = (stat.tx_bytes + stat.rx_bytes) * 8
+                        last_duration = self.workload_status[dpid][port_no][2] + self.workload_status[dpid][port_no][3] * 1e-9
+                        curr_duration = stat.duration_sec + stat.duration_nsec * 1e-9
+                        work_load = (curr_bits - last_bits) / (curr_duration - last_duration) * 1e-6
+                        self.workload[dpid][port_no] = work_load
+
+                self.workload_status[dpid][port_no] = value
+        
+        # print result
+        print('###########################################################################')
+        for dpid in sorted(self.workload.keys()):
+            print('<dpid={}>'.format(dpid), end='\t')
+            for port in self.workload[dpid]:
+                print('<port={}, workload={:.6f}>'.format(port, self.workload[dpid][port]), end='\t')
+            print()
 
 ############################detect topology############################
     def get_topology(self, ev):
@@ -179,6 +200,65 @@ class Workload(app_manager.RyuApp):
     def handle_arp(self, msg):
 
         # just your code in exp1 mission2
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+
+        dpid = dp.id
+        in_port = msg.match['in_port']
+
+        pkt = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+
+        dst = eth_pkt.dst
+        src = eth_pkt.src
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+
+        dpid = dp.id
+        self.mac_to_port.setdefault(dpid, {})
+
+        header_list = dict((p.protocol_name, p)
+                           for p in pkt.protocols if type(p) != str)
+        if dst == ETHERNET_MULTICAST and ARP in header_list:
+            arp_dst_ip = header_list[ARP].dst_ip
+            if (dp.id, src, arp_dst_ip) in self.sw:
+                if self.sw[(dp.id, src, arp_dst_ip)] != in_port:
+                    # drop the packet
+                    out = parser.OFPPacketOut(
+                        datapath=dp,
+                        buffer_id=ofp.OFP_NO_BUFFER,
+                        in_port=in_port,
+                        actions=[],
+                        data=None)
+                    dp.send_msg(out)
+                    return
+                else:
+                    pass
+            else:
+                self.sw[(dp.id, src, arp_dst_ip)] = in_port
+
+        self.mac_to_port[dpid][src] = in_port
+
+        if dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
+        else:
+            out_port = ofp.OFPP_FLOOD
+
+        actions = [parser.OFPActionOutput(out_port)]
+
+        if out_port != ofp.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+            self.add_flow(dp, 1, match, actions)
+
+        out = parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=in_port,
+            actions=actions,
+            data=msg.data)
+        dp.send_msg(out)
 
         ############################get shortest(hop) path############################
     def handle_ipv4(self, msg, src_ip, dst_ip, pkt_type):
@@ -195,7 +275,7 @@ class Workload(app_manager.RyuApp):
             in_port = self.link_info[(dpid_path[i], dpid_path[i - 1])]
             out_port = self.link_info[(dpid_path[i], dpid_path[i + 1])]
             port_path.append((in_port, dpid_path[i], out_port))
-        self.show_path(src_ip, dst_ip, port_path)
+        # self.show_path(src_ip, dst_ip, port_path)
 
         # send flow mod
         for node in port_path:
