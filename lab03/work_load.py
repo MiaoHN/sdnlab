@@ -1,3 +1,6 @@
+from cmath import exp
+from unittest import expectedFailure
+from dbus import NameExistsException
 import networkx as nx
 from operator import attrgetter
 from ryu.base import app_manager
@@ -21,6 +24,8 @@ ETHERNET = ethernet.ethernet.__name__
 ETHERNET_MULTICAST = "ff:ff:ff:ff:ff:ff"
 ARP = arp.arp.__name__
 
+topo_events = [event.EventSwitchEnter, event.EventLinkAdd, event.EventPortAdd]
+
 
 class Workload(app_manager.RyuApp):
 
@@ -29,28 +34,41 @@ class Workload(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(Workload, self).__init__(*args, **kwargs)
         self.topology_api_app = self
-        self.datapaths = {}  # dpid: datapath
-        self.port_stats = {}  # (dpid,port_no):a list of port_stats
-        self.link_info = {}  # (s1, s2): s1.port
-        self.port_link = {}  # s1,port:s1,s2
-        self.port_info = {}  # dpid: (ports linked hosts)
-        self.topo_map = nx.Graph()
-        self.workload_thread = hub.spawn(self._count_workload)
-        self.mac_to_port = {}
-        self.sw = {}  # use it to avoid arp loop
-        self.weight = 'hop'
-
-        # dpid: {port_no : work_load}
-        self.workload = {}  
+        # dpid: datapath
+        self.datapaths = {}
 
         # dpid: {port_no: (tx_bytes, rx_bytes, duration_sec, duration_nsec)}
-        self.workload_status = {} 
+        self.port_stats = {}
+
+        # (s1, s2): s1.port
+        self.ss_port = {}
+
+        # s1,port:s1,s2
+        self.sp_ss = {}
+
+        # dpid: (ports linked hosts)
+        self.port_info = {}
+
+        self.switch_port = {}
+
+        # host: (dpid, port_no)
+        self.host_info = {}
+
+        self.topo_map = nx.Graph()
+        self.workload_thread = hub.spawn(self._count_workload)
+
+        self.mac_to_port = {}
+
+        self.sw = {}  # use it to avoid arp loop
+
+        # dpid: {port_no : work_load}
+        self.workload = {}
 
     def _count_workload(self):
         while True:
             for dp in self.datapaths.values():
                 self._send_request(dp)
-            self.get_topology(None)
+            # self.get_topology(None)
             hub.sleep(4)
 
     def _send_request(self, datapath):
@@ -96,7 +114,7 @@ class Workload(app_manager.RyuApp):
         body = ev.msg.body
         dpid = ev.msg.datapath.id
         self.workload.setdefault(dpid, {})
-        self.workload_status.setdefault(dpid, {})
+        self.port_stats.setdefault(dpid, {})
         # you need to code here to finish mission1
         # of course, you can define new function as you wish
         for stat in sorted(body, key=attrgetter('port_no')):
@@ -104,100 +122,63 @@ class Workload(app_manager.RyuApp):
             if port_no != ofproto_v1_3.OFPP_LOCAL:
                 value = (stat.tx_bytes, stat.rx_bytes,
                          stat.duration_sec, stat.duration_nsec)
-                if dpid in self.workload_status:
+                if dpid in self.port_stats:
                     # if dpid has record then calculate
-                    if port_no in self.workload_status[dpid]:
-                        last_bits = (self.workload_status[dpid][port_no][0] + self.workload_status[dpid][port_no][1]) * 8
+                    if port_no in self.port_stats[dpid]:
+                        last_bits = (
+                            self.port_stats[dpid][port_no][0] + self.port_stats[dpid][port_no][1]) * 8
                         curr_bits = (stat.tx_bytes + stat.rx_bytes) * 8
-                        last_duration = self.workload_status[dpid][port_no][2] + self.workload_status[dpid][port_no][3] * 1e-9
+                        last_duration = self.port_stats[dpid][port_no][2] + \
+                            self.port_stats[dpid][port_no][3] * 1e-9
                         curr_duration = stat.duration_sec + stat.duration_nsec * 1e-9
-                        work_load = (curr_bits - last_bits) / (curr_duration - last_duration) * 1e-6
+                        work_load = (curr_bits - last_bits) / \
+                            (curr_duration - last_duration) * 1e-6
                         self.workload[dpid][port_no] = work_load
 
-                self.workload_status[dpid][port_no] = value
-        
-        # print result
-        print('###########################################################################')
-        for dpid in sorted(self.workload.keys()):
-            print('<dpid={}>'.format(dpid), end='\t')
-            for port in self.workload[dpid]:
-                print('<port={}, workload={:.6f}>'.format(port, self.workload[dpid][port]), end='\t')
-            print()
+                self.port_stats[dpid][port_no] = value
 
-############################detect topology############################
+    @set_ev_cls(topo_events)
     def get_topology(self, ev):
-        """
-            Gett topology info to calculate shortest paths.
-        """
-        _hosts, _switches, _links = None, None, None
-        hosts = get_host(self)
         switches = get_switch(self)
-        links = get_link(self)
-
-        # update topo_map when topology change
-        if [str(x) for x in hosts] == _hosts and [str(x) for x in switches] == _switches and [str(x) for x in
-                                                                                              links] == _links:
-            return
-        _hosts, _switches, _links = [str(x) for x in hosts], [str(
-            x) for x in switches], [str(x) for x in links]
-
         for switch in switches:
-            self.port_info.setdefault(switch.dp.id, set())
-            # record all ports
-            for port in switch.ports:
-                self.port_info[switch.dp.id].add(port.port_no)
+            self.datapaths[switch.dp.id] = switch.dp
 
-        for host in hosts:
-            # take one ipv4 address as host id
-            if host.ipv4:
-                self.link_info[(host.port.dpid, host.ipv4[0])
-                               ] = host.port.port_no
-                self.topo_map.add_edge(
-                    host.ipv4[0], host.port.dpid, hop=1, delay=0, is_host=True)
+            self.mac_to_port.setdefault(switch.dp.id, {})
+            self.switch_port.setdefault(switch.dp.id, set())
+
+        links = get_link(self)
         for link in links:
-            # delete ports linked switches
-            self.port_info[link.src.dpid].discard(link.src.port_no)
-            self.port_info[link.dst.dpid].discard(link.dst.port_no)
-
-            # s1 -> s2: s1.port, s2 -> s1: s2.port
-            self.port_link[(link.src.dpid, link.src.port_no)] = (
-                link.src.dpid, link.dst.dpid)
-            self.port_link[(link.dst.dpid, link.dst.port_no)] = (
-                link.dst.dpid, link.src.dpid)
-
-            self.link_info[(link.src.dpid, link.dst.dpid)] = link.src.port_no
-            self.link_info[(link.dst.dpid, link.src.dpid)] = link.dst.port_no
-            self.topo_map.add_edge(
-                link.src.dpid, link.dst.dpid, hop=1, is_host=False)
+            self.topo_map.add_edge(link.src.dpid, link.dst.dpid)
+            self.ss_port[(link.src.dpid, link.dst.dpid)] = link.src.port_no
+            self.ss_port[(link.dst.dpid, link.src.dpid)] = link.dst.port_no
+            self.switch_port[link.src.dpid].add(link.src.port_no)
+            self.switch_port[link.dst.dpid].add(link.dst.port_no)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
-        dp = msg.datapath
-        ofp = dp.ofproto
-        parser = dp.ofproto_parser
-
-        dpid = dp.id
-        in_port = msg.match['in_port']
+        dpid = msg.datapath.id
 
         pkt = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
         arp_pkt = pkt.get_protocol(arp.arp)
         ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
 
-        pkt_type = eth_pkt.ethertype
         # layer 2 self-learning
-        dst_mac = eth_pkt.dst
+        in_port = msg.match['in_port']
         src_mac = eth_pkt.src
+        self.mac_to_port.setdefault(dpid, {})
+        if src_mac not in self.mac_to_port[dpid]:
+            self.mac_to_port[dpid][src_mac] = in_port
 
         if isinstance(arp_pkt, arp.arp):
-            self.handle_arp(msg)
+            self.handle_arp(msg, arp_pkt)
 
         if isinstance(ipv4_pkt, ipv4.ipv4):
-            self.handle_ipv4(msg, ipv4_pkt.src, ipv4_pkt.dst, pkt_type)
+            self.handle_ipv4(msg, ipv4_pkt)
 
 ############################deal with loop############################
-    def handle_arp(self, msg):
+    def handle_arp(self, msg, arp_pkt):
 
         # just your code in exp1 mission2
         dp = msg.datapath
@@ -206,6 +187,9 @@ class Workload(app_manager.RyuApp):
 
         dpid = dp.id
         in_port = msg.match['in_port']
+
+        if in_port not in self.switch_port[dpid]:
+            self.host_info[arp_pkt.src_ip] = (dpid, in_port)
 
         pkt = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
@@ -217,27 +201,21 @@ class Workload(app_manager.RyuApp):
         parser = dp.ofproto_parser
 
         dpid = dp.id
-        self.mac_to_port.setdefault(dpid, {})
 
-        header_list = dict((p.protocol_name, p)
-                           for p in pkt.protocols if type(p) != str)
-        if dst == ETHERNET_MULTICAST and ARP in header_list:
-            arp_dst_ip = header_list[ARP].dst_ip
-            if (dp.id, src, arp_dst_ip) in self.sw:
-                if self.sw[(dp.id, src, arp_dst_ip)] != in_port:
-                    # drop the packet
-                    out = parser.OFPPacketOut(
-                        datapath=dp,
-                        buffer_id=ofp.OFP_NO_BUFFER,
-                        in_port=in_port,
-                        actions=[],
-                        data=None)
-                    dp.send_msg(out)
-                    return
-                else:
-                    pass
-            else:
-                self.sw[(dp.id, src, arp_dst_ip)] = in_port
+        arp_dst_ip = arp_pkt.dst_ip
+        if (dp.id, src, arp_dst_ip) in self.sw:
+            if self.sw[(dp.id, src, arp_dst_ip)] != in_port:
+                # drop the packet
+                out = parser.OFPPacketOut(
+                    datapath=dp,
+                    buffer_id=ofp.OFP_NO_BUFFER,
+                    in_port=in_port,
+                    actions=[],
+                    data=None)
+                dp.send_msg(out)
+                return
+        else:
+            self.sw[(dp.id, src, arp_dst_ip)] = in_port
 
         self.mac_to_port[dpid][src] = in_port
 
@@ -250,7 +228,7 @@ class Workload(app_manager.RyuApp):
 
         if out_port != ofp.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            self.add_flow(dp, 1, match, actions)
+            self.add_flow(dp, 1, match, actions, 90, 180)
 
         out = parser.OFPPacketOut(
             datapath=dp,
@@ -261,57 +239,114 @@ class Workload(app_manager.RyuApp):
         dp.send_msg(out)
 
         ############################get shortest(hop) path############################
-    def handle_ipv4(self, msg, src_ip, dst_ip, pkt_type):
+    def handle_ipv4(self, msg, ipv4_pkt):
+        ofp = msg.datapath.ofproto
         parser = msg.datapath.ofproto_parser
 
-        dpid_path = self.shortest_path(src_ip, dst_ip, weight=self.weight)
+        ipv4_src = ipv4_pkt.src
+        ipv4_dst = ipv4_pkt.dst
+
+        dpid_begin = self.host_info[ipv4_src][0]
+        port_begin = self.host_info[ipv4_src][1]
+
+        dpid_final = self.host_info[ipv4_dst][0]
+        port_final = self.host_info[ipv4_dst][1]
+
+        dpid_path = self.shortest_path(dpid_begin, dpid_final)
         if not dpid_path:
             return
+        print('path {} -> {}: {}'.format(ipv4_src, ipv4_dst, dpid_path))
 
-        self.path = dpid_path
-        # get port path:  h1 -> in_port, s1, out_port -> h2
-        port_path = []
-        for i in range(1, len(dpid_path) - 1):
-            in_port = self.link_info[(dpid_path[i], dpid_path[i - 1])]
-            out_port = self.link_info[(dpid_path[i], dpid_path[i + 1])]
-            port_path.append((in_port, dpid_path[i], out_port))
-        # self.show_path(src_ip, dst_ip, port_path)
+        # add flow entry
+        for i in range(len(dpid_path)):
+            curr_switch = dpid_path[i]
 
-        # send flow mod
-        for node in port_path:
-            in_port, dpid, out_port = node
-            self.send_flow_mod(parser, dpid, pkt_type,
-                               src_ip, dst_ip, in_port, out_port)
-            self.send_flow_mod(parser, dpid, pkt_type,
-                               dst_ip, src_ip, out_port, in_port)
+            if i == 0:
+                next_switch = dpid_path[i + 1]
+                out_port = self.ss_port[(curr_switch, next_switch)]
+                actions = [parser.OFPActionOutput(out_port)]
+                match = parser.OFPMatch(
+                    eth_type=0x800, ipv4_src=ipv4_src, ipv4_dst=ipv4_dst)
+                self.add_flow(
+                    self.datapaths[curr_switch], 20, match, actions, 300, 600)
 
-        # send packet_out
-        _, dpid, out_port = port_path[-1]
-        dp = self.datapaths[dpid]
-        actions = [parser.OFPActionOutput(out_port)]
-        out = parser.OFPPacketOut(
-            datapath=dp, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
-        dp.send_msg(out)
+            elif i == len(dpid_path) - 1:
+                out_port = port_final
+                actions = [parser.OFPActionOutput(out_port)]
+                match = parser.OFPMatch(
+                    eth_type=0x800, ipv4_src=ipv4_src, ipv4_dst=ipv4_dst)
+                self.add_flow(
+                    self.datapaths[curr_switch], 20, match, actions, 300, 600)
 
-    def shortest_path(self, src, dst, weight='hop'):
+                pre_switch = dpid_path[i - 1]
+                out_port = self.ss_port[(curr_switch, pre_switch)]
+                actions = [parser.OFPActionOutput(out_port)]
+                match = parser.OFPMatch(
+                    eth_type=0x800, ipv4_src=ipv4_dst, ipv4_dst=ipv4_src)
+                self.add_flow(
+                    self.datapaths[curr_switch], 20, match, actions, 300, 600)
+            else:
+
+                prev_switch = dpid_path[i - 1]
+                next_switch = dpid_path[i + 1]
+
+                port1 = self.ss_port[(curr_switch, next_switch)]
+                port2 = self.ss_port[(curr_switch, prev_switch)]
+
+                out_port = port1
+                actions = [parser.OFPActionOutput(out_port)]
+                match = parser.OFPMatch(
+                    eth_type=0x800, ipv4_src=ipv4_src, ipv4_dst=ipv4_dst)
+                self.add_flow(
+                    self.datapaths[curr_switch], 20, match, actions, 300, 600)
+
+                out_port = port2
+                actions = [parser.OFPActionOutput(out_port)]
+                match = parser.OFPMatch(
+                    eth_type=0x800, ipv4_src=ipv4_dst, ipv4_dst=ipv4_src)
+                self.add_flow(
+                    self.datapaths[curr_switch], 20, match, actions, 300, 600)
+
+        data = None
+        if msg.buffer_id == ofp.OFP_NO_BUFFER:
+
+            data = msg.data
+            out_port = port_final
+            actions = [parser.OFPActionOutput(out_port)]
+            out = parser.OFPPacketOut(
+                datapath=self.datapaths[dpid_final], buffer_id=ofp.OFP_NO_BUFFER, in_port=ofp.OFP_NO_BUFFER, actions=actions, data=data)
+            self.datapaths[dpid_final].send_msg(out)
+            # print('switch {} -> port {}'.format(dpid_final, port_final))
+        else:
+            out_port = port_begin
+            actions = [parser.OFPActionOutput(out_port)]
+            out = parser.OFPPacketOut(
+                datapath=self.datapaths[dpid_final], buffer_id=msg.buffer_id, in_port=msg.match['in_port'], actions=actions, data=data)
+            msg.datapath.send_msg(out)
+
+    def shortest_path(self, dpid_begin, dpid_final):
         try:
             paths = list(nx.shortest_simple_paths(
-                self.topo_map, src, dst, weight=weight))
-            return paths[0]
+                self.topo_map, dpid_begin, dpid_final))
+            path_neck = []
+            for i in range(len(paths)):
+                neck = []
+                for j in range(len(paths[i]) - 1):
+                    curr_switch = paths[i][j]
+                    next_switch = paths[i][j + 1]
+
+                    curr_port = self.ss_port[(curr_switch, next_switch)]
+                    next_port = self.ss_port[(next_switch, curr_switch)]
+
+                    curr_workload = self.workload[curr_switch][curr_port]
+                    next_workload = self.workload[next_switch][next_port]
+
+                    aviliable = 1000 - max(curr_workload, next_workload)
+                    neck.append(aviliable)
+                path_neck.append(min(neck))
+
+            index = path_neck.index(max(path_neck))
+            print('max neck: {}'.format(path_neck[index]))
+            return paths[index]
         except:
             self.logger.info('host not find/no path')
-
-    def send_flow_mod(self, parser, dpid, pkt_type, src_ip, dst_ip, in_port, out_port):
-        dp = self.datapaths[dpid]
-        match = parser.OFPMatch(
-            in_port=in_port, eth_type=pkt_type, ipv4_src=src_ip, ipv4_dst=dst_ip)
-        actions = [parser.OFPActionOutput(out_port)]
-        self.add_flow(dp, 5, match, actions, 10, 30)
-
-    def show_path(self, src, dst, port_path):
-        self.logger.info('path: {} -> {}'.format(src, dst))
-        path = src + ' -> '
-        for node in port_path:
-            path += '{}:s{}:{}'.format(*node) + ' -> '
-        path += dst
-        self.logger.info(path)
