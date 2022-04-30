@@ -1,3 +1,4 @@
+import copy
 from cmath import exp
 from unittest import expectedFailure
 from dbus import NameExistsException
@@ -24,7 +25,6 @@ ETHERNET = ethernet.ethernet.__name__
 ETHERNET_MULTICAST = "ff:ff:ff:ff:ff:ff"
 ARP = arp.arp.__name__
 
-import copy
 
 topo_events = [event.EventSwitchEnter, event.EventLinkAdd, event.EventPortAdd]
 
@@ -151,6 +151,7 @@ class Workload(app_manager.RyuApp):
 
             self.mac_to_port.setdefault(switch.dp.id, {})
             self.switch_port.setdefault(switch.dp.id, set())
+            self.sw.setdefault(switch.dp.id, {})
 
         links = get_link(self)
         for link in links:
@@ -186,73 +187,70 @@ class Workload(app_manager.RyuApp):
 ############################deal with loop############################
     def handle_arp(self, msg, arp_pkt):
 
-        # just your code in exp1 mission2
-        dp = msg.datapath
-        ofp = dp.ofproto
-        parser = dp.ofproto_parser
+        out_port = None
+        eth_dst = None
 
-        dpid = dp.id
+        dpid = msg.datapath.id
+        ofp = msg.datapath.ofproto
+        parser = msg.datapath.ofproto_parser
         in_port = msg.match['in_port']
 
         if in_port not in self.switch_port[dpid]:
             self.host_info[arp_pkt.src_ip] = (dpid, in_port)
 
-        pkt = packet.Packet(msg.data)
-        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+        if arp_pkt.opcode == arp.ARP_REQUEST:
 
-        dst = eth_pkt.dst
-        src = eth_pkt.src
-        dp = msg.datapath
-        ofp = dp.ofproto
-        parser = dp.ofproto_parser
+            arp_dst_ip = arp_pkt.dst_ip
+            arp_src_mac = arp_pkt.src_mac
 
-        dpid = dp.id
-
-        arp_dst_ip = arp_pkt.dst_ip
-        if (dp.id, src, arp_dst_ip) in self.sw:
-            if self.sw[(dp.id, src, arp_dst_ip)] != in_port:
-                # drop the packet
-                out = parser.OFPPacketOut(
-                    datapath=dp,
-                    buffer_id=ofp.OFP_NO_BUFFER,
-                    in_port=in_port,
-                    actions=[],
-                    data=None)
-                dp.send_msg(out)
-                return
-        else:
-            self.sw[(dp.id, src, arp_dst_ip)] = in_port
-
-        self.mac_to_port[dpid][src] = in_port
-
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
-        else:
+            if arp_src_mac not in self.sw[dpid].keys():
+                self.sw[dpid].setdefault(arp_src_mac, {})
+                self.sw[dpid][arp_src_mac][arp_dst_ip] = in_port
+            else:
+                if arp_dst_ip not in self.sw[dpid][arp_src_mac].keys():
+                    self.sw[dpid][arp_src_mac][arp_dst_ip] = in_port
+                else:
+                    if in_port != self.sw[dpid][arp_src_mac][arp_dst_ip]:
+                        # avoid loop
+                        return
             out_port = ofp.OFPP_FLOOD
+        else:
+            pkt = packet.Packet(msg.data)
+            eth_pkt = pkt.get_protocol(ethernet.ethernet)
+            eth_dst = eth_pkt.dst
+
+            if eth_dst in self.mac_to_port[dpid].keys():
+                out_port = self.mac_to_port[dpid][eth_dst]
+            else:
+                out_port = ofp.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
 
         if out_port != ofp.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            self.add_flow(dp, 1, match, actions, 90, 180)
+            match = parser.OFPMatch(in_port=ofp.OFPP_ANY, eth_dst=eth_dst)
+            self.add_flow(msg.datapath, 10, match, actions, 90, 180)
 
-        out = parser.OFPPacketOut(
-            datapath=dp,
-            buffer_id=ofp.OFP_NO_BUFFER,
-            in_port=in_port,
-            actions=actions,
-            data=msg.data)
-        dp.send_msg(out)
+        data = None
+        if msg.buffer_id == ofp.OFP_NO_BUFFER:
+            data = msg.data
+        out = parser.OFPPacketOut(datapath=msg.datapath, buffer_id=msg.buffer_id,
+                                  in_port=in_port, actions=actions, data=data)
+        msg.datapath.send_msg(out)
 
     def army_handler(self, ipv4_src, ipv4_dst, dpid_begin, dpid_final, port_begin, port_final, msg):
+        print('army handler')
 
         parser = self.datapaths[1].ofproto_parser
         ofp = self.datapaths[1].ofproto
+        fport = -1
 
         topo = copy.deepcopy(self.topo_map)
         topo.remove_node(dpid_final)
-        path1 = nx.shortest_simple_paths(topo, dpid_begin, dpid_TINKER)
-        path2 = nx.shortest_simple_paths(self.topo_map, dpid_TINKER, dpid_final)
+        path1 = nx.shortest_path(topo, dpid_begin, dpid_TINKER)
+        path2 = nx.shortest_path(self.topo_map, dpid_TINKER, dpid_final)
+
+        print('path {} -> TINKER: {}'.format(ipv4_src, path1))
+        print('path TINKER -> {}: {}'.format(ipv4_dst, path2))
 
         for i in range(len(path1)):
             curr_switch = path1[i]
@@ -260,6 +258,7 @@ class Workload(app_manager.RyuApp):
             if i == 0:
                 next_switch = path1[i + 1]
                 out_port = self.ss_port[(curr_switch, next_switch)]
+                fport = out_port
                 actions = [parser.OFPActionOutput(out_port)]
                 match = parser.OFPMatch(
                     eth_type=0x800, ipv4_src=ipv4_src, ipv4_dst=ipv4_dst)
@@ -302,7 +301,7 @@ class Workload(app_manager.RyuApp):
                     eth_type=0x800, ipv4_src=ipv4_dst, ipv4_dst=ipv4_src)
                 self.add_flow(
                     self.datapaths[curr_switch], 20, match, actions, 300, 600)
-        
+
         for i in range(len(path2)):
             curr_switch = path2[i]
 
@@ -351,13 +350,12 @@ class Workload(app_manager.RyuApp):
                     eth_type=0x800, ipv4_src=ipv4_dst, ipv4_dst=ipv4_src)
                 self.add_flow(
                     self.datapaths[curr_switch], 20, match, actions, 300, 600)
-        #####
 
         data = None
         if msg.buffer_id == ofp.OFP_NO_BUFFER:
 
             data = msg.data
-            out_port = port_final
+            out_port = fport
             actions = [parser.OFPActionOutput(out_port)]
             out = parser.OFPPacketOut(
                 datapath=self.datapaths[dpid_final], buffer_id=ofp.OFP_NO_BUFFER, in_port=ofp.OFP_NO_BUFFER, actions=actions, data=data)
@@ -370,9 +368,6 @@ class Workload(app_manager.RyuApp):
                 datapath=self.datapaths[dpid_final], buffer_id=msg.buffer_id, in_port=msg.match['in_port'], actions=actions, data=data)
             msg.datapath.send_msg(out)
 
-        #############################################################################################################################################################################
-        pass
-
         ############################get shortest(hop) path############################
     def handle_ipv4(self, msg, ipv4_pkt):
         ofp = msg.datapath.ofproto
@@ -380,6 +375,7 @@ class Workload(app_manager.RyuApp):
 
         ipv4_src = ipv4_pkt.src
         ipv4_dst = ipv4_pkt.dst
+        print('get ipv4: {} -> {}'.format(ipv4_src, ipv4_dst))
 
         dpid_begin = self.host_info[ipv4_src][0]
         port_begin = self.host_info[ipv4_src][1]
@@ -388,7 +384,8 @@ class Workload(app_manager.RyuApp):
         port_final = self.host_info[ipv4_dst][1]
 
         if (ipv4_src, ipv4_dst) in [(ipv4_ILLINOIS, ipv4_UTAH), (ipv4_UTAH, ipv4_ILLINOIS)]:
-            self.army_handler(ipv4_src, ipv4_dst, dpid_begin, dpid_final, port_begin, port_final, msg)
+            self.army_handler(ipv4_src, ipv4_dst, dpid_begin,
+                              dpid_final, port_begin, port_final, msg)
             return
 
         dpid_path = self.shortest_path(dpid_begin, dpid_final)
