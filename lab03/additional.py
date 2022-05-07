@@ -187,55 +187,63 @@ class Workload(app_manager.RyuApp):
 ############################deal with loop############################
     def handle_arp(self, msg, arp_pkt):
 
-        out_port = None
-        eth_dst = None
+        # just your code in exp1 mission2
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
 
-        dpid = msg.datapath.id
-        ofp = msg.datapath.ofproto
-        parser = msg.datapath.ofproto_parser
+        dpid = dp.id
         in_port = msg.match['in_port']
 
         if in_port not in self.switch_port[dpid]:
             self.host_info[arp_pkt.src_ip] = (dpid, in_port)
 
-        if arp_pkt.opcode == arp.ARP_REQUEST:
+        pkt = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
 
-            arp_dst_ip = arp_pkt.dst_ip
-            arp_src_mac = arp_pkt.src_mac
+        dst = eth_pkt.dst
+        src = eth_pkt.src
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
 
-            if arp_src_mac not in self.sw[dpid].keys():
-                self.sw[dpid].setdefault(arp_src_mac, {})
-                self.sw[dpid][arp_src_mac][arp_dst_ip] = in_port
-            else:
-                if arp_dst_ip not in self.sw[dpid][arp_src_mac].keys():
-                    self.sw[dpid][arp_src_mac][arp_dst_ip] = in_port
-                else:
-                    if in_port != self.sw[dpid][arp_src_mac][arp_dst_ip]:
-                        # avoid loop
-                        return
-            out_port = ofp.OFPP_FLOOD
+        dpid = dp.id
+
+        arp_dst_ip = arp_pkt.dst_ip
+        if (dp.id, src, arp_dst_ip) in self.sw:
+            if self.sw[(dp.id, src, arp_dst_ip)] != in_port:
+                # drop the packet
+                out = parser.OFPPacketOut(
+                    datapath=dp,
+                    buffer_id=ofp.OFP_NO_BUFFER,
+                    in_port=in_port,
+                    actions=[],
+                    data=None)
+                dp.send_msg(out)
+                return
         else:
-            pkt = packet.Packet(msg.data)
-            eth_pkt = pkt.get_protocol(ethernet.ethernet)
-            eth_dst = eth_pkt.dst
+            self.sw[(dp.id, src, arp_dst_ip)] = in_port
 
-            if eth_dst in self.mac_to_port[dpid].keys():
-                out_port = self.mac_to_port[dpid][eth_dst]
-            else:
-                out_port = ofp.OFPP_FLOOD
+        self.mac_to_port[dpid][src] = in_port
+
+        if dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
+        else:
+            out_port = ofp.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
 
         if out_port != ofp.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=ofp.OFPP_ANY, eth_dst=eth_dst)
-            self.add_flow(msg.datapath, 10, match, actions, 90, 180)
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+            self.add_flow(dp, 1, match, actions, 90, 180)
 
-        data = None
-        if msg.buffer_id == ofp.OFP_NO_BUFFER:
-            data = msg.data
-        out = parser.OFPPacketOut(datapath=msg.datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
-        msg.datapath.send_msg(out)
+        out = parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=in_port,
+            actions=actions,
+            data=msg.data)
+        dp.send_msg(out)
 
     def army_handler(self, ipv4_src, ipv4_dst, dpid_begin, dpid_final, port_begin, port_final, msg):
         print('army handler')
@@ -244,10 +252,12 @@ class Workload(app_manager.RyuApp):
         ofp = self.datapaths[1].ofproto
         fport = -1
 
-        topo = copy.deepcopy(self.topo_map)
-        topo.remove_node(dpid_final)
-        path1 = nx.shortest_path(topo, dpid_begin, dpid_TINKER)
-        path2 = nx.shortest_path(self.topo_map, dpid_TINKER, dpid_final)
+        topo1 = copy.deepcopy(self.topo_map)
+        topo1.remove_node(dpid_final)
+        topo2 = copy.deepcopy(self.topo_map)
+        topo2.remove_node(dpid_begin)
+        path1 = nx.shortest_path(topo1, dpid_begin, dpid_TINKER)
+        path2 = nx.shortest_path(topo2, dpid_TINKER, dpid_final)
 
         print('path {} -> TINKER: {}'.format(ipv4_src, path1))
         print('path TINKER -> {}: {}'.format(ipv4_dst, path2))
